@@ -125,8 +125,14 @@ usertrapret(void)
   // jump to userret in trampoline.S at the top of memory, which 
   // switches to the user page table, restores user registers,
   // and switches to user mode with sret.
+  // lab3: offset trapframe
   uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
-  ((void (*)(uint64))trampoline_userret)(satp);
+  //lab3
+  if(p->thread_id){ //threads other than the original one
+      ((void (*)(uint64, uint64))trampoline_userret)(TRAPFRAME - PGSIZE * p->thread_id, satp);
+  } else { // if the thread is the first one or the one that is cloned from
+      ((void (*)(uint64, uint64))trampoline_userret)(TRAPFRAME, satp);
+  }
 }
 
 // interrupts and exceptions from kernel code go here via kernelvec,

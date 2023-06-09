@@ -89,3 +89,13 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+uint64
+sys_clone(void) {
+  //goal here is -  int clone(void *stack); So we need a variable named stack
+  uint64 stack;
+  argaddr(0, &stack); //argaddr (int, uint64*) => stack should be uint64
+  int returnvalue = clone((void*) stack);// return thread id to the original one
+  return returnvalue;
+}
+

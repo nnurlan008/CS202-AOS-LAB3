@@ -1,3 +1,4 @@
+#include "stddef.h" 
 #include "types.h"
 #include "param.h"
 #include "memlayout.h"
@@ -13,10 +14,13 @@ struct proc proc[NPROC];
 struct proc *initproc;
 
 int nextpid = 1;
+int nextthread_id = 1; //lab3: for assigning id to threads - the first child after parents has id=1
 struct spinlock pid_lock;
+struct spinlock thread_id_lock; //lab3: for lock over threads
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
+static void freethread(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
 
@@ -50,6 +54,7 @@ procinit(void)
   struct proc *p;
   
   initlock(&pid_lock, "nextpid");
+  initlock(&thread_id_lock, "nextthread_id");
   initlock(&wait_lock, "wait_lock");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
@@ -123,6 +128,7 @@ allocproc(void)
 
 found:
   p->pid = allocpid();
+  p->thread_id=0; //lab3: initial the thread id as 0 which is for the original thread or the parent
   p->state = USED;
 
   // Allocate a trapframe page.
@@ -161,6 +167,35 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  p->sz = 0;
+  p->pid = 0;
+  p->parent = 0;
+  p->name[0] = 0;
+  p->chan = 0;
+  p->killed = 0;
+  p->xstate = 0;
+  p->state = UNUSED;
+}
+
+static void
+freethread(struct proc *p)
+{
+  if(p->trapframe)
+    kfree((void*)p->trapframe);
+  p->trapframe = 0;
+  
+
+  if (p->pagetable){ 
+    if(p->thread_id) {
+      uvmunmap(p->pagetable, TRAPFRAME - PGSIZE*(p->thread_id), 1, 0);
+    }
+  }
+  else if(p->pagetable){
+    proc_freepagetable(p->pagetable, p->sz);
+  }
+  
+  p->pagetable = 0;
+  p->thread_id = 0; //lab3: set thread_id = 0 
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -352,11 +387,13 @@ exit(int status)
     panic("init exiting");
 
   // Close all open files.
-  for(int fd = 0; fd < NOFILE; fd++){
-    if(p->ofile[fd]){
-      struct file *f = p->ofile[fd];
-      fileclose(f);
-      p->ofile[fd] = 0;
+  if(p->thread_id ==0){  // lab3: if the process was parent
+    for(int fd = 0; fd < NOFILE; fd++){
+      if(p->ofile[fd]){
+        struct file *f = p->ofile[fd];
+        fileclose(f);
+        p->ofile[fd] = 0;
+      }
     }
   }
 
@@ -368,7 +405,10 @@ exit(int status)
   acquire(&wait_lock);
 
   // Give any children to init.
-  reparent(p);
+  //we only wants to assign childeren to init when there is no thread
+  if(p->thread_id ==0){
+    reparent(p);
+  }
 
   // Parent might be sleeping in wait().
   wakeup(p->parent);
@@ -414,7 +454,18 @@ wait(uint64 addr)
             release(&wait_lock);
             return -1;
           }
-          freeproc(pp);
+          
+          //lab3
+          if(pp->thread_id > 0){
+            freethread(pp);
+            acquire(&thread_id_lock);
+            nextthread_id--;
+            release(&thread_id_lock);
+          }
+          else{
+            freeproc(pp);
+          }
+
           release(&pp->lock);
           release(&wait_lock);
           return pid;
@@ -680,4 +731,93 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+static struct proc*
+allocthread(void)
+{
+  struct proc *p;
+  for(p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if(p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  int thread_id;//lab3
+  p->pid = allocpid();
+  //lab3
+  // the same tasks with allocpid but we use it for alocating thread id 
+  acquire(&thread_id_lock);
+  thread_id = nextthread_id++;
+  release(&thread_id_lock);
+  p->thread_id = thread_id;
+
+  p->state = USED;
+
+  // Allocate a trapframe page.
+  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  } 
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  return p;
+
+}
+
+
+int clone(void* stack){
+
+  int i, thread_id; //thread_id instead of pid
+  struct proc *np;
+  struct proc *p = myproc();
+  int pageSizeByte = PGSIZE*sizeof(void);
+
+  if(stack == NULL) //if the argument=stack is valid we will continue
+    return -1;// if not return -1
+  // change this from Allocate process to allocate thread.
+  if((np = allocthread()) == 0){ // clone is different from fork => new function
+    return -1;
+  }
+
+  //in clone the child thread has the same pagetable as the parent thread
+  np->pagetable = p->pagetable; // thus assign same page table
+  thread_id = np->thread_id;
+  np->sz = p->sz;
+  // create new trapframe
+  // same as the example in lab description but the location should be based on thread id to prevent overwritten.
+  if(mappages(np->pagetable, TRAPFRAME - (PGSIZE * np->thread_id), PGSIZE, (uint64)(np->trapframe), PTE_R | PTE_W) < 0){
+    return 0;
+  }
+  //specifying the child’s user stack’s address byte-wise
+  np->trapframe->sp = (uint64)(stack + pageSizeByte);
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+  // increment reference counts on open file descriptors.
+  for(i = 0; i < NOFILE; i++)
+    if(p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+  safestrcpy(np->name, p->name, sizeof(p->name));
+  release(&np->lock);
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+  //return id
+  return thread_id;
 }
